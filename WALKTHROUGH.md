@@ -209,36 +209,101 @@ hidden 1024) — the identical megakernel technique applies and would remove the
 remaining ~4.8 s. That's the highest-leverage follow-up; it was left out only because the task
 scoped the talker as the target.
 
-## Step 9 — Package the deliverable
+## Step 9 — Self-review against the deliverables, and the decision to go further
 
-- `setup.sh` — reproducible install (cu128 torch for sm_120, transformers pinned 4.57.3 for
-  qwen-tts, pipecat, model downloads).
-- `README.md` — reference: architecture, kernel mods, parity table, performance, run instructions.
-- `samples/` — audio artifacts (HF baseline, megakernel talker, streamed) since this is a headless
-  GPU box with no mic/speaker.
-- This `WALKTHROUGH.md` — the process narrative.
+At this point the *literal* task was done (talker ported, parity proven, streaming Pipecat
+service) — but reviewing the submission against the deliverables list like an evaluator
+exposed four gaps: RTF was 0.9 vs a < 0.15 target, there was no inference *server* process,
+the headless Pipecat pipeline stalled, and the voice demo had never actually been run
+end-to-end. Our own stage breakdown pointed at the single fix that mattered: **the code
+predictor was 95% of remaining runtime, and it's also a Qwen3 stack.** "Out of scope" was
+true but unsatisfying when the same technique closes the target. So: port it.
 
----
+## Step 10 — Port the code predictor (the scoped-out stage that was the actual bottleneck)
 
-## What's rough (carried verbatim from the honest README, so it's not lost here)
+Reading the config confirmed it's *exactly* kernel-shaped — hidden 1024, 16 Q / 8 KV × 128,
+intermediate 3072, QK-norm — just **5 layers** (a runtime arg!) and **vocab 2048** (a second
+`-DLDG_VOCAB_SIZE` build, loaded in parallel under its own torch op namespace). The HF flow
+per frame is a 2-embedding prefill (`past_hidden`, group-0 embedding) + 14 decode steps with
+**per-group embeddings and lm-heads** — and HF was running a *full `GenerationMixin.generate`
+call per frame* (~69 ms, ≈ 4.6 ms per 5-layer sub-step: framework overhead, not GPU). We
+replaced that one instance method with a flat loop of megakernel steps: per-group heads passed
+per call, sampling replicating HF's warper stack, static 1D rope tables. ~2.7 ms/frame, 26×.
 
-- **End-to-end RTF ≈ 0.9–1.2, not < 0.15** — bottleneck is the out-of-scope code predictor (Step 8).
-- **Talker is batch=1** (the megakernel is single-sequence by design).
-- **Streaming still uses HF's Python generation loop** — a custom decode loop would shave per-step
-  overhead.
-- **Transport-less Pipecat `PipelineRunner` GIL-starves**: HF's Python-heavy gen loop holds the GIL
-  so a runner with no output transport stalls after the first chunks. `pc_verify.py` is the
-  deterministic proof of the streaming contract; a real deployment paces the pipeline with an
-  output transport (`pipeline_demo.py voice`) and/or runs TTS in a separate worker process.
-- **Upstream-kernel RoPE θ observation**: the kernel's own `model.py` builds RoPE with base 1e4
-  while Qwen3-0.6B specifies `rope_theta=1e6`; fixing θ alone didn't fully restore its self-check
-  parity (`scripts/rope_bug.py`), so there's likely additional precision loss. Our port sidesteps
-  this entirely by feeding HF-exact RoPE tables, and achieves bit-level argmax parity.
+**Parity, done honestly:** greedy replay matched 4/11 frames exactly, 76% of tokens — which
+*looks* bad until you isolate cascade from per-step error. Teacher-forcing HF's own tokens:
+**93.9% per-step argmax match, logits cos-sim ≥ 0.9998, and every flip sits at an HF top-2
+margin of 0–0.25 — exact bf16 ties.** Coin-flip tokens; immaterial under the default sampling.
+Lesson: when an autoregressive parity number looks scary, decompose it before panicking.
 
-## Final-testing checklist (this round, all green)
+## Step 11 — The kernel deadlock (the best find of the project)
+
+First threaded streaming run with the new port: **GPU pegged at 100% for 17 minutes.** The same
+code path had just run ~2000 launches single-threaded in the benchmark. Reading the kernel's
+barrier code found it: the kernel replaces cooperative `grid.sync()` with an atomic
+`{counter, sense}` spin barrier, and **block 0 resets those flags on-device at kernel start
+while other blocks are already arriving at the first barrier**. An early-arriving block can slip
+past the start barrier on the *previous* launch's non-zero sense; the reset then eats its
+arrival, the barrier stays one short, and 127 blocks spin forever. It's a probabilistic,
+scheduling-dependent race that upstream never hits at 12.5 talker launches/s — at ~200 code
+predictor launches/s it fired within seconds. (Supporting evidence it was a race: the identical
+run had succeeded minutes earlier.)
+
+**Fix:** reset the flags with a single stream-ordered 16-byte `cudaMemsetAsync` *before* each
+launch — race-free by stream ordering — and compile out the on-device reset, behind
+`-DLDG_HOST_BARRIER_RESET` (off by default; upstream behavior untouched). Verified with the
+previously-hanging workload 5× back-to-back, zero hangs, zero cost (0.814 ms/step unchanged).
+
+## Step 12 — Serve it properly: server process + thin Pipecat client
+
+The earlier "headless PipelineRunner starves on the GIL" caveat had an architectural fix that
+also satisfied the "build an inference server" deliverable: `server.py` (FastAPI websocket,
+JSON in → binary PCM chunks out, pushed as decoded) owns the GPU and the Python-heavy loop in
+its own process; `MegakernelQwen3TTSWebsocketService` is a thin async client — exactly how real
+Pipecat TTS services are shaped. Result: `pipeline_demo.py headless` now runs a real
+`Pipeline`/`PipelineRunner` to a clean `EndFrame` finish (11 frames, 5.4 s wav).
+
+## Step 13 — The voice agent, on a box with no UDP and no microphone
+
+Two environment facts shaped the demo design: (a) Vast containers forward **TCP only**, so
+browser WebRTC media (aiortc = UDP ICE) cannot connect — Pipecat's **websocket transport** on
+a single TCP port (SSH-tunnelable, secure-context-friendly) is the right transport here;
+(b) the box is headless, so we wrote a small browser client (AudioWorklet mic capture at
+16 kHz → protobuf frames; 24 kHz playback) served by `voice_demo.py`:
+`browser ↔ websocket ↔ [VAD → Whisper STT → LLM → megakernel TTS] `.
+
+Two pipecat-1.3 landmines worth recording: the `vad_analyzer` transport param is **silently
+ignored** (VAD is now a standalone `VADProcessor` between transport and STT — without it,
+segmented STT never fires and the pipeline looks "connected but deaf"); and the first Whisper
+transcription pays ~8 s of cuDNN/CTranslate2 warmup mid-conversation unless you warm it at
+startup.
+
+**End-to-end validation without a mic:** we synthesized "What is two plus two?" with our own
+TTS, streamed it into the websocket as if it were mic audio, and watched the full loop run:
+VAD start/stop → Whisper: `[ What is 2 plus 2? ]` → response → megakernel TTS → streamed PCM
+back out (`samples/voice_loop_echo.wav`, and an `--llm echo` mode exists so the demo needs no
+API key). Measured turn latency ~0.85 s, of which 0.8 s is Silero's default stop-of-speech
+window. The human-with-a-mic recording is the only remaining manual step (README §7).
+
+## What's rough (kept honest)
+
+- **TTFC 75–190 ms** depending on path, vs the strictest 60 ms target — the residue is HF
+  `generate()` startup (~95 ms of Python), not GPU; a custom prefill loop is the known fix.
+- **Batch = 1** by kernel design; the server serializes concurrent requests.
+- **Code-predictor greedy parity flips on exact bf16 ties** (Step 10) — statistically invisible
+  under sampling, but it is not bit-exact.
+- **Upstream RoPE θ observation** stands: `model.py` uses 1e4 vs the model's 1e6
+  (`scripts/rope_bug.py`); our port feeds HF-exact tables instead.
+
+## Final-testing checklist (this round, all green, after the kernel race fix)
 
 ```
-python scripts/parity_test.py   →  EXIT 0, argmax identical 10/10, cos 0.9997–0.9999
-python scripts/benchmark.py     →  EXIT 0, talker 33×, RTF 1.29→0.91, talker 29.6%→4.0%
-python scripts/pc_verify.py     →  EXIT 0, 43 frames, TTFC 337 ms, incremental delivery
+python -m qwen_megakernel.bench →  1033.8 tok/s, 0.97 ms/tok (baseline intact)
+scripts/parity_test.py          →  argmax identical 10/10, cos 0.9997–0.9999
+scripts/cp_parity_test.py       →  93.9% teacher-forced argmax, flips only at bf16 ties
+scripts/benchmark.py            →  talker 30.6×; RTF 1.272 → 0.905 → 0.077
+mk_tts streaming ×5             →  TTFC 75–114 ms, RTF 0.15–0.22, no hangs
+scripts/pc_verify.py            →  TTFC 130–190 ms, RTF ~0.22, incremental frames
+scripts/pipeline_demo.py        →  real PipelineRunner, clean EndFrame finish
+voice loop (synthetic speech)   →  VAD → "What is 2 plus 2?" → spoken reply, ~0.85 s turn
 ```

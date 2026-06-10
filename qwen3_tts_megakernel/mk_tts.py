@@ -31,14 +31,20 @@ _DONE = object()
 
 class StreamingMegakernelTTS:
     def __init__(self, model_path="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-                 device="cuda:0", use_megakernel=True, attn="sdpa"):
+                 device="cuda:0", use_megakernel=True, use_megakernel_cp=True,
+                 attn="sdpa"):
         self.tts = Qwen3TTSModel.from_pretrained(
             model_path, device_map=device, dtype=torch.bfloat16,
             attn_implementation=attn)
         self.use_megakernel = use_megakernel
         self.engine = None
+        self.cp_engine = None
         if use_megakernel:
             self.engine = mk_talker.install_megakernel_talker(self.tts.model)
+            if use_megakernel_cp:
+                import mk_code_predictor
+                self.cp_engine = \
+                    mk_code_predictor.install_megakernel_code_predictor(self.tts.model)
         self._decode = self.tts.model.speech_tokenizer.decode
         self._lock = threading.Lock()
 
@@ -52,13 +58,21 @@ class StreamingMegakernelTTS:
         return wav[off: off + (end - start) * SAMPLES_PER_FRAME]
 
     def stream(self, text, speaker="Ryan", language="English", instruct="",
-               max_new_tokens=2048, chunk_frames=2, lookback=6,
-               do_sample=True, seed=0):
+               max_new_tokens=2048, chunk_frames=8, lookback=6,
+               do_sample=True, seed=0, first_chunks=(1, 2, 4)):
         """Yield (pcm_int16_bytes, sr) chunks as audio is produced.
 
-        chunk_frames: emit granularity (2 -> ~160 ms chunks).
-        lookback:     vocoder context frames to avoid boundary clicks.
+        chunk_frames: steady-state emit granularity (8 -> ~640 ms chunks).
+        first_chunks: adaptive ramp-up sizes — the first chunk is 1 frame
+                      (80 ms) so TTFC is gated by one talker frame, then
+                      chunks grow to amortize the vocoder lookback overhead.
+        lookback:     vocoder context frames to avoid boundary clicks (the
+                      first chunks need none/few — capped at frames emitted).
         """
+        sizes = list(first_chunks)
+
+        def next_chunk_size(i):
+            return sizes[i] if i < len(sizes) else chunk_frames
         frames = []                      # list[Tensor[1,16]] full history
         fq: "queue.Queue" = queue.Queue()
 
@@ -95,6 +109,7 @@ class StreamingMegakernelTTS:
             t.start()
 
             emitted = 0                       # frames already vocoded+sent
+            chunk_i = 0
             while True:
                 item = fq.get()
                 if item is _DONE:
@@ -102,10 +117,11 @@ class StreamingMegakernelTTS:
                 if isinstance(item, tuple) and item and item[0] == "__err__":
                     raise item[1]
                 frames.append(item)
-                while len(frames) - emitted >= chunk_frames:
-                    end = emitted + chunk_frames
+                while len(frames) - emitted >= next_chunk_size(chunk_i):
+                    end = emitted + next_chunk_size(chunk_i)
                     pcm = self._vocode(frames, emitted, end, lookback)
                     emitted = end
+                    chunk_i += 1
                     yield self._to_int16(pcm), SR
             # flush remaining frames
             if len(frames) > emitted:
@@ -128,7 +144,7 @@ if __name__ == "__main__":
         pass
 
     t0 = time.time(); ttfc = None; chunks = []
-    for pcm, sr in eng.stream(text, max_new_tokens=512, do_sample=False, chunk_frames=2):
+    for pcm, sr in eng.stream(text, max_new_tokens=512, do_sample=False):
         if ttfc is None:
             ttfc = time.time() - t0
         chunks.append(np.frombuffer(pcm, dtype=np.int16))

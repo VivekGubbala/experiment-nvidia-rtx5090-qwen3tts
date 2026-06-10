@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Megakernel Qwen3-TTS voice agent</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; }
+  button { font-size: 1.1rem; padding: .6rem 1.6rem; cursor: pointer; }
+  #log { margin-top: 1rem; padding: 1rem; background: #f4f4f4; border-radius: 8px;
+         min-height: 8rem; white-space: pre-wrap; font-size: .9rem; }
+  .pill { display:inline-block; padding:.15rem .6rem; border-radius:999px;
+          background:#ddd; margin-left:.5rem; font-size:.8rem; }
+  .on { background:#9f9; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/protobufjs@7.4.0/dist/protobuf.min.js"></script>
+</head>
+<body>
+<h2>Megakernel Qwen3-TTS voice agent</h2>
+<p>Click Start, allow the microphone, and talk. Speech goes
+mic &rarr; Whisper STT &rarr; LLM &rarr; megakernel TTS &rarr; back here.</p>
+<button id="btn">Start</button><span id="state" class="pill">idle</span>
+<div id="log"></div>
+
+<script>
+const PROTO = `
+syntax = "proto3";
+package pipecat;
+message TextFrame { uint64 id=1; string name=2; string text=3; }
+message AudioRawFrame { uint64 id=1; string name=2; bytes audio=3;
+                        uint32 sample_rate=4; uint32 num_channels=5;
+                        optional uint64 pts=6; }
+message TranscriptionFrame { uint64 id=1; string name=2; string text=3;
+                             string user_id=4; string timestamp=5; }
+message MessageFrame { string data=1; }
+message InterruptionFrame { uint64 id=1; string name=2; }
+message Frame { oneof frame { TextFrame text=1; AudioRawFrame audio=2;
+                TranscriptionFrame transcription=3; MessageFrame message=4;
+                InterruptionFrame interruption=5; } }`;
+
+const IN_RATE = 16000, OUT_RATE = 24000;
+let ws, audioCtx, workletNode, micStream, FrameMsg, running = false;
+let playHead = 0;
+
+const log = (s) => { const el = document.getElementById("log");
+  el.textContent += s + "\n"; el.scrollTop = el.scrollHeight; };
+const setState = (s, on) => { const el = document.getElementById("state");
+  el.textContent = s; el.className = "pill" + (on ? " on" : ""); };
+
+// 16 kHz int16 mono capture via an AudioWorklet (inline module).
+const WORKLET = `
+class Capture extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (ch) this.port.postMessage(ch.slice(0));
+    return true;
+  }
+}
+registerProcessor("capture", Capture);`;
+
+function downsampleTo16k(f32, fromRate) {
+  const ratio = fromRate / IN_RATE, n = Math.floor(f32.length / ratio);
+  const out = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    const v = f32[Math.floor(i * ratio)];
+    out[i] = Math.max(-1, Math.min(1, v)) * 32767;
+  }
+  return out;
+}
+
+function playPcm(bytes, rate) {
+  const n = bytes.length / 2;
+  const i16 = new Int16Array(bytes.buffer, bytes.byteOffset, n);
+  const buf = audioCtx.createBuffer(1, n, rate);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) ch[i] = i16[i] / 32768;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf; src.connect(audioCtx.destination);
+  const t = Math.max(audioCtx.currentTime + 0.04, playHead);
+  src.start(t); playHead = t + buf.duration;
+}
+
+async function start() {
+  const root = protobuf.parse(PROTO).root;
+  FrameMsg = root.lookupType("pipecat.Frame");
+
+  audioCtx = new AudioContext();
+  micStream = await navigator.mediaDevices.getUserMedia(
+    { audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { setState("connected", true); log("connected"); };
+  ws.onclose = () => { setState("closed", false); log("closed"); stop(); };
+  ws.onmessage = (ev) => {
+    const f = FrameMsg.decode(new Uint8Array(ev.data));
+    if (f.audio) playPcm(f.audio.audio, f.audio.sampleRate || OUT_RATE);
+    else if (f.transcription) log("you: " + f.transcription.text);
+    else if (f.text) log("bot: " + f.text.text);
+  };
+
+  await audioCtx.audioWorklet.addModule(
+    URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })));
+  const src = audioCtx.createMediaStreamSource(micStream);
+  workletNode = new AudioWorkletNode(audioCtx, "capture");
+  src.connect(workletNode);
+  workletNode.port.onmessage = (ev) => {
+    if (!ws || ws.readyState !== 1) return;
+    const pcm = downsampleTo16k(ev.data, audioCtx.sampleRate);
+    const payload = FrameMsg.encode(FrameMsg.create({ audio: {
+      audio: new Uint8Array(pcm.buffer), sampleRate: IN_RATE, numChannels: 1,
+    }})).finish();
+    ws.send(payload);
+  };
+  running = true;
+  document.getElementById("btn").textContent = "Stop";
+}
+
+function stop() {
+  running = false;
+  try { ws && ws.close(); } catch {}
+  try { workletNode && workletNode.disconnect(); } catch {}
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch {}
+  try { audioCtx && audioCtx.close(); } catch {}
+  playHead = 0;
+  document.getElementById("btn").textContent = "Start";
+  setState("idle", false);
+}
+
+document.getElementById("btn").onclick = () => running ? stop() : start();
+</script>
+</body>
+</html>

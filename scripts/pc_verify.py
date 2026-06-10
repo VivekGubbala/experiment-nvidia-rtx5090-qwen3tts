@@ -5,7 +5,7 @@ from pc_tts import MegakernelQwen3TTSService
 from mk_tts import SR
 
 async def main():
-    svc = MegakernelQwen3TTSService(do_sample=True, chunk_frames=2, lookback=8)
+    svc = MegakernelQwen3TTSService(do_sample=True)
     text = "Hello! I'm a voice agent running on a megakernel powered text to speech system."
     # warmup
     async for _ in svc.run_tts("warm up", "w"): pass

@@ -1213,7 +1213,10 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
   int block_id = blockIdx.x;
   int num_blocks = gridDim.x;
 
-  // Reset barrier counters + flags on-device
+#ifndef LDG_HOST_BARRIER_RESET
+  // Reset barrier counters + flags on-device. NOTE: this races with other
+  // blocks' first barrier arrival below; build with -DLDG_HOST_BARRIER_RESET
+  // to reset stream-ordered from the host instead (see launch functions).
   if (block_id == 0 && threadIdx.x == 0) {
     *barrier_counter = 0;
     *barrier_sense = 0;
@@ -1221,6 +1224,7 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
     atomicExch(attn_flag, 0u);
   }
   __syncthreads();
+#endif
   if (threadIdx.x == 0) {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
     unsigned int arrived = atomicAdd(barrier_counter, 1);
@@ -1332,6 +1336,8 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
   int block_id = blockIdx.x;
   int num_blocks = gridDim.x;
 
+#ifndef LDG_HOST_BARRIER_RESET
+  // See note in ldg_decode_kernel_persistent: racy; prefer host-side reset.
   if (block_id == 0 && threadIdx.x == 0) {
     *barrier_counter = 0;
     *barrier_sense = 0;
@@ -1339,6 +1345,7 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
     atomicExch(attn_flag, 0u);
   }
   __syncthreads();
+#endif
   if (threadIdx.x == 0) {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
     unsigned int arrived = atomicAdd(barrier_counter, 1);
@@ -1457,10 +1464,12 @@ int *h_pinned_token_id = nullptr;
 
 static void ensure_barrier_alloc() {
   if (!d_barrier_counter) {
-    cudaMalloc(&d_barrier_counter, sizeof(unsigned int));
-    cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
-    cudaMalloc(&d_kv_flag, sizeof(unsigned int));
-    cudaMalloc(&d_attn_flag, sizeof(unsigned int));
+    // one contiguous block: {counter, sense, kv_flag, attn_flag} so a single
+    // 16-byte memset can clear all four (see LDG_HOST_BARRIER_RESET)
+    cudaMalloc(&d_barrier_counter, 4 * sizeof(unsigned int));
+    d_barrier_sense = d_barrier_counter + 1;
+    d_kv_flag = d_barrier_counter + 2;
+    d_attn_flag = d_barrier_counter + 3;
     cudaMalloc(&d_lm_head_counter, sizeof(unsigned int));
     cudaMalloc(&d_mutable_position, sizeof(int));
     cudaMalloc(&d_mutable_token_id, sizeof(int));
@@ -1487,6 +1496,15 @@ extern "C" void launch_ldg_decode_direct(
     float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+
+#ifdef LDG_HOST_BARRIER_RESET
+  // Stream-ordered reset of {counter, sense, kv_flag, attn_flag}: the
+  // on-device reset (block 0) races with other blocks' first barrier
+  // arrival -- a block that arrives before the reset can pass the start
+  // barrier on the previous launch's non-zero sense, leaving the barrier
+  // one arrival short and every other block spinning forever.
+  cudaMemsetAsync(d_barrier_counter, 0, 4 * sizeof(unsigned int), stream);
+#endif
 
   ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
       (const __nv_bfloat16 *)embed_weight, layer_weights,
@@ -1517,6 +1535,10 @@ extern "C" void launch_ldg_decode_persistent(
     int max_seq_len, float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+
+#ifdef LDG_HOST_BARRIER_RESET
+  cudaMemsetAsync(d_barrier_counter, 0, 4 * sizeof(unsigned int), stream);
+#endif
 
   // Write mutable params via pinned host memory (barriers reset on-device)
   *h_pinned_position = position;

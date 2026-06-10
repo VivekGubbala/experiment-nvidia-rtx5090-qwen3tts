@@ -1,25 +1,25 @@
-"""Pipecat demos for the megakernel Qwen3-TTS service.
+"""Pipecat pipeline demos for the megakernel Qwen3-TTS service.
 
-Two modes:
+  python pipeline_demo.py headless          # real Pipecat Pipeline, headless:
+                                            # TTSSpeakFrame -> websocket TTS
+                                            # -> streamed audio -> pipeline_out.wav
+                                            # (start server.py first)
 
-  python pipeline_demo.py headless     # runs a real Pipecat Pipeline headless,
-                                        # TTSSpeakFrame -> audio frames -> out.wav
-                                        # (proves the service inside a Pipeline)
+  python pipeline_demo.py headless-inproc   # same pipeline but with the
+                                            # in-process TTS service (loads the
+                                            # model here; can GIL-starve a
+                                            # transport-less runner — kept for
+                                            # comparison/documentation)
 
-  python pipeline_demo.py voice        # full voice agent:
-                                        # mic -> Whisper STT -> LLM -> our TTS -> speaker
-                                        # (needs an audio device + OPENAI_API_KEY,
-                                        #  or swap in Ollama for a fully local LLM)
+For the full voice agent (browser mic -> STT -> LLM -> TTS -> speaker) see
+voice_demo.py.
 """
 import os
 import sys
 import asyncio
 import wave
 
-import numpy as np
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "qwen3_tts_megakernel"))
-from pc_tts import MegakernelQwen3TTSService  # noqa: E402
 from mk_tts import SR  # noqa: E402
 
 from pipecat.frames.frames import (  # noqa: E402
@@ -34,7 +34,7 @@ from pipecat.processors.frame_processor import FrameProcessor, FrameDirection  #
 class WavCollector(FrameProcessor):
     """Sink that captures streamed TTSAudioRawFrames and writes a wav at EndFrame."""
 
-    def __init__(self, path="out.wav", done: "asyncio.Event" = None):
+    def __init__(self, path="pipeline_out.wav", done: "asyncio.Event" = None):
         super().__init__()
         self._path = path
         self._buf = bytearray()
@@ -62,28 +62,29 @@ class WavCollector(FrameProcessor):
               f"({len(self._buf)//2/SR:.2f}s from {self._n} frames)", flush=True)
 
 
-async def headless():
-    # NOTE: this drives a transport-less Pipecat Pipeline in-process. Audio
-    # frames stream correctly (see prints), but the heavy GPU+Python generation
-    # loop contends with the asyncio event loop for the GIL, so a transport-less
-    # runner does not always drain/finalize cleanly. For a deterministic proof of
-    # the streaming TTSService contract run `pc_verify.py`; for a real agent use
-    # `pipeline_demo.py voice` (a transport paces/drains the pipeline).
+def make_tts(mode):
+    if mode == "headless-inproc":
+        from pc_tts import MegakernelQwen3TTSService
+        return MegakernelQwen3TTSService(do_sample=True)
+    from pc_tts import MegakernelQwen3TTSWebsocketService
+    return MegakernelQwen3TTSWebsocketService()      # needs server.py running
+
+
+async def headless(mode):
     done = asyncio.Event()
-    tts = MegakernelQwen3TTSService(do_sample=True, chunk_frames=2, lookback=8,
-                                    max_new_tokens=256)
+    tts = make_tts(mode)
     sink = WavCollector("pipeline_out.wav", done=done)
     task = PipelineTask(Pipeline([tts, sink]))
     text = "This audio is streaming through a real Pipecat pipeline, frame by frame."
     runner = PipelineRunner(handle_sigint=False)
-    print("[headless] queueing frames + running task...", flush=True)
+    print(f"[{mode}] queueing frames + running task...", flush=True)
     run_t = asyncio.create_task(runner.run(task))
     await task.queue_frames([TTSSpeakFrame(text), EndFrame()])
     try:
-        await asyncio.wait_for(done.wait(), timeout=90)
-        print("[headless] EndFrame reached sink; clean finish", flush=True)
+        await asyncio.wait_for(done.wait(), timeout=120)
+        print(f"[{mode}] EndFrame reached sink; clean finish", flush=True)
     except asyncio.TimeoutError:
-        print("[headless] timeout; writing partial audio", flush=True)
+        print(f"[{mode}] TIMEOUT; writing partial audio", flush=True)
         sink._write()
     finally:
         run_t.cancel()
@@ -93,33 +94,6 @@ async def headless():
             pass
 
 
-def build_voice_pipeline():
-    """Full mic->STT->LLM->TTS->speaker voice agent (reference wiring)."""
-    from pipecat.transports.local.audio import (
-        LocalAudioTransport, LocalAudioTransportParams)
-    from pipecat.services.whisper.stt import WhisperSTTService
-    from pipecat.services.openai.llm import OpenAILLMService
-    from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-
-    transport = LocalAudioTransport(LocalAudioTransportParams(
-        audio_in_enabled=True, audio_out_enabled=True, audio_out_sample_rate=SR))
-    stt = WhisperSTTService()  # local whisper
-    llm = OpenAILLMService(model="gpt-4o-mini", api_key=os.environ["OPENAI_API_KEY"])
-    tts = MegakernelQwen3TTSService(do_sample=True, chunk_frames=2)
-    ctx = OpenAILLMContext([
-        {"role": "system", "content": "You are a concise, friendly voice assistant."}])
-    agg = llm.create_context_aggregator(ctx)
-    pipeline = Pipeline([
-        transport.input(), stt, agg.user(), llm, tts,
-        transport.output(), agg.assistant(),
-    ])
-    return PipelineTask(pipeline)
-
-
-async def voice():
-    await PipelineRunner().run(build_voice_pipeline())
-
-
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "headless"
-    asyncio.run(headless() if mode == "headless" else voice())
+    asyncio.run(headless(mode))

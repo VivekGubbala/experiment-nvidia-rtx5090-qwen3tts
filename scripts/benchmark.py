@@ -51,11 +51,11 @@ print(f"talker speedup: {hf_ms/mk_ms:.2f}x")
 banner("2. END-TO-END (full TTS pipeline) HF vs Megakernel-talker")
 def run_e2e(label, mnt=512):
     T={"cp":0.0,"voc":0.0}
-    _cg=MM.Qwen3TTSTalkerCodePredictorModelForConditionalGeneration.generate
-    @functools.wraps(_cg)
-    def cg(self,*a,**k):
-        torch.cuda.synchronize();t0=time.time();r=_cg(self,*a,**k);torch.cuda.synchronize();T["cp"]+=time.time()-t0;return r
-    MM.Qwen3TTSTalkerCodePredictorModelForConditionalGeneration.generate=cg
+    cp_obj=tts.model.talker.code_predictor
+    _cg=cp_obj.generate                      # instance attr: times HF *or* MK path
+    def cg(*a,**k):
+        torch.cuda.synchronize();t0=time.time();r=_cg(*a,**k);torch.cuda.synchronize();T["cp"]+=time.time()-t0;return r
+    cp_obj.generate=cg
     _d=tts.model.speech_tokenizer.decode
     def dec(*a,**k):
         torch.cuda.synchronize();t0=time.time();r=_d(*a,**k);torch.cuda.synchronize();T["voc"]+=time.time()-t0;return r
@@ -63,12 +63,16 @@ def run_e2e(label, mnt=512):
     torch.manual_seed(0);torch.cuda.synchronize();t0=time.time()
     w,sr=tts.generate_custom_voice(text=TEXT,language="English",speaker="Ryan",instruct="",max_new_tokens=mnt,do_sample=False,subtalker_dosample=False)
     torch.cuda.synchronize();tot=time.time()-t0
-    MM.Qwen3TTSTalkerCodePredictorModelForConditionalGeneration.generate=_cg
+    cp_obj.generate=_cg
     tts.model.speech_tokenizer.decode=_d
     dur=len(w[0])/sr
-    print(f"{label:16s} total={tot:6.3f}s audio={dur:4.2f}s RTF={tot/dur:5.3f} | codePred(out-of-scope)={T['cp']*1000:6.0f}ms({100*T['cp']/tot:4.1f}%) vocoder={T['voc']*1000:5.0f}ms({100*T['voc']/tot:4.1f}%) talker+rest={ (tot-T['cp']-T['voc'])*1000:6.0f}ms({100*(tot-T['cp']-T['voc'])/tot:4.1f}%)")
+    print(f"{label:22s} total={tot:6.3f}s audio={dur:4.2f}s RTF={tot/dur:5.3f} | codePred={T['cp']*1000:6.0f}ms({100*T['cp']/tot:4.1f}%) vocoder={T['voc']*1000:5.0f}ms({100*T['voc']/tot:4.1f}%) talker+rest={ (tot-T['cp']-T['voc'])*1000:6.0f}ms({100*(tot-T['cp']-T['voc'])/tot:4.1f}%)")
     return tot,dur
 run_e2e("HF baseline")
 mk_talker.install_megakernel_talker(tts.model)
-run_e2e("Megakernel")
-print("\n(greedy/do_sample=False for reproducibility; code predictor = the 'codebook generator', explicitly out of scope)")
+run_e2e("MK talker")
+import mk_code_predictor
+mk_code_predictor.install_megakernel_code_predictor(tts.model)
+run_e2e("MK talker+codePred")
+print("\n(greedy/do_sample=False for reproducibility; code predictor = the 'codebook generator' --")
+print(" scoped out of the original task but ported anyway since it dominated runtime)")

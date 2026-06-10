@@ -44,8 +44,9 @@ MAX_SEQ = 4096
 _CSRC = "/workspace/assignment/qwen_megakernel/csrc"
 
 
-def build_talker_ext(vocab=VOCAB):
-    """Compile the megakernel with the codec vocab; distinct module name."""
+def build_ext(name, vocab):
+    """Compile the megakernel with a given lm-head vocab under a distinct
+    module name (the op registers as torch.ops.<name>.decode)."""
     kernel_flags = [
         "-DLDG_NUM_BLOCKS=128", "-DLDG_BLOCK_SIZE=512",
         "-DLDG_LM_NUM_BLOCKS=1280", "-DLDG_LM_BLOCK_SIZE=384",
@@ -56,15 +57,23 @@ def build_talker_ext(vocab=VOCAB):
         "-DLDG_PREFETCH_UP=1", "-DLDG_USE_UINT4", "-DLDG_ATTENTION_VEC4",
         "-DLDG_WEIGHT_LDCS", "-DLDG_MLP_SMEM",
         f"-DLDG_VOCAB_SIZE={vocab}",
+        # fixes a start-of-launch barrier-reset race in the upstream kernel
+        # (probabilistic hang under dense launch rates; see README)
+        "-DLDG_HOST_BARRIER_RESET",
     ]
     flags = ["-O3", "--use_fast_math", "-std=c++17", "--expt-relaxed-constexpr",
              "-arch=sm_120a", f"-I{_CSRC}"] + kernel_flags
     return load(
-        name="qwen_megakernel_tts_C",
+        name=name,
         sources=[os.path.join(_CSRC, "torch_bindings.cpp"),
                  os.path.join(_CSRC, "kernel.cu")],
         extra_cuda_cflags=flags, extra_cflags=[f"-I{_CSRC}"], verbose=False,
     )
+
+
+def build_talker_ext(vocab=VOCAB):
+    """Compile the megakernel with the codec vocab; distinct module name."""
+    return build_ext("qwen_megakernel_tts_C", vocab)
 
 
 def mrope_interleave(cos, sin, mrope_section):
