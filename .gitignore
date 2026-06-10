@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Compiled / JIT build artifacts (megakernel)
+*.so
+build/
+
+# Generated audio + run outputs (keep curated samples/)
+*.wav
+!samples/
+!samples/*.wav
+
+# Scratch / local
+work/
+.env
+*.log
