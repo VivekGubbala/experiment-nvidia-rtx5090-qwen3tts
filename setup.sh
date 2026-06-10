@@ -1,6 +1,9 @@
 #!/bin/bash
 # Reproducible setup for the megakernel Qwen3-TTS -> Pipecat demo on an RTX 5090
 # (sm_120 / Blackwell). Run from the repo root. Assumes the Vast /venv/main env.
+#
+# Clone with submodules:  git clone --recurse-submodules <repo>
+# (or run this script as-is; step 2 inits the Qwen3-TTS submodule for you.)
 set -e
 source /venv/main/bin/activate
 export HF_HOME=${HF_HOME:-/workspace/.hf_home}
@@ -9,13 +12,14 @@ export HF_HOME=${HF_HOME:-/workspace/.hf_home}
 #    An older cu124 wheel installs but dies with "no kernel image" on Blackwell.
 uv pip install "torch>=2.7" torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# 2. Qwen3-TTS package (pins transformers==4.57.3; torch is left untouched).
+# 2. Qwen3-TTS package (a git submodule; pins transformers==4.57.3; torch untouched).
+#    Pulls the pinned submodule in case you cloned without --recurse-submodules.
 uv pip install "transformers==4.57.3" "accelerate==1.12.0" librosa soundfile sox onnxruntime einops
-git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS.git 2>/dev/null || true
+git submodule update --init --recursive
 uv pip install -e ./Qwen3-TTS --no-deps
 
-# 3. The megakernel (JIT-compiled on first import for sm_120) + Pipecat.
-git clone --depth 1 https://github.com/AlpinDale/qwen_megakernel.git 2>/dev/null || true
+# 3. Pipecat. (qwen_megakernel is vendored in-repo with our LDG_VOCAB_SIZE edit —
+#    no clone needed; it JIT-compiles for sm_120 on first import.)
 uv pip install pipecat-ai websockets
 
 # 4. Models (~2.4 GB talker + tokenizer/vocoder).
