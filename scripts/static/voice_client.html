@@ -68,8 +68,11 @@ function downsampleTo16k(f32, fromRate) {
 }
 
 function playPcm(bytes, rate) {
-  const n = bytes.length / 2;
-  const i16 = new Int16Array(bytes.buffer, bytes.byteOffset, n);
+  const n = Math.floor(bytes.length / 2);
+  // protobuf.js yields a Uint8Array view at an arbitrary byteOffset; Int16Array
+  // views need 2-byte alignment, so copy to a fresh buffer first.
+  const aligned = bytes.slice(0, n * 2);
+  const i16 = new Int16Array(aligned.buffer, 0, n);
   const buf = audioCtx.createBuffer(1, n, rate);
   const ch = buf.getChannelData(0);
   for (let i = 0; i < n; i++) ch[i] = i16[i] / 32768;
