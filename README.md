@@ -285,3 +285,9 @@ with synthetic speech; upstream kernel race found, explained, and fixed.
   RTF < 0.04.
 - The browser demo needs the user's mic/laptop (this box is headless); the
   in-repo validation uses synthesized speech over the same code path.
+
+---
+
+## Demo Video
+
+[![Watch the demo](https://img.youtube.com/vi/NupaNXsHYQg/hqdefault.jpg)](https://youtu.be/NupaNXsHYQg)
